@@ -38,11 +38,15 @@
 
           buildInputs = [
             pkgs.vulkan-loader
+            pkgs.openssl
           ];
 
           # Force the in-process GGUF inference engine with the Vulkan backend.
           buildFeatures = [ "vulkan" ];
 
+          OPENSSL_DIR = "${pkgs.openssl.dev}";
+          OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
+          OPENSSL_INCLUDE_DIR = "${pkgs.openssl.dev}/include";
           # Hardcode the Vulkan loader into the binary so the GPU is never lost,
           # even when the agent is launched via `sudo` (which scrubs the
           # environment). Without this, `nixos-rebuild` activation under sudo
