@@ -1,97 +1,140 @@
 # nix-agent
 
-> **Talk to your machine. It rewrites itself.**
-> A local, air-gapped AI agent that declaratively mutates and self-heals your NixOS configuration — no cloud, no API keys, no Ollama daemon. Just one binary and your GPU.
+> Natural-language patches for NixOS.
+> Plan first. Review the module. Apply deliberately.
 
-[![Built with Rust](https://img.shields.io/badge/built_with-Rust-000000?logo=rust)](https://www.rust-lang.org/)
-[![NixOS](https://img.shields.io/badge/NixOS-flake-5277C3?logo=nixos&logoColor=white)](https://nixos.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](#license)
+![status](https://img.shields.io/badge/status-experimental%20alpha-orange)
+![platform](https://img.shields.io/badge/platform-NixOS-5277C3?logo=nixos&logoColor=white)
+![built with](https://img.shields.io/badge/built%20with-Rust-000000?logo=rust)
+![license](https://img.shields.io/badge/license-MIT-green)
 
----
+`nix-agent` turns plain-English configuration requests into small, isolated NixOS modules. It does not run arbitrary shell commands, and it does not edit your main `configuration.nix`. Instead it generates a patch module, validates it, shows you what would change, and applies it only when you explicitly ask.
 
-`nix-agent` turns a sentence into a verified system change. You describe what you
-want in plain English; the agent retrieves the relevant NixOS options from a
-local index, generates a Nix module with an **in-process LLM**, parses it through
-an AST gate, runs `nixos-rebuild`, and — if the build breaks — reads the
-compiler's own error and repairs its output. Up to three times. Silently.
+Talk to your machine. It writes a patch. You decide whether it lands.
 
-It never edits your files imperatively. It generates valid Nix, tests it, and
-shows you a `git diff`. If anything fails, your original configuration is
-restored untouched.
+The whole tool is built around one sentence:
+
+> prompt → isolated Nix module → validation → review → explicit apply
 
 ---
 
-## Key Features
+## Status
 
-- **🧠 Embedded GGUF inference — no Ollama, no network.** Runs
-  [Qwen2.5-Coder](https://huggingface.co/Qwen) directly inside the binary via
-  `llama.cpp`, with full GPU offload through **Vulkan** (Linux/NixOS) or
-  **Metal** (macOS). After the first-run model download, it is fully air-gapped.
-- **⚙️ Automatic hardware-tier profiling.** Inspects host RAM at startup and
-  selects the largest model your machine can comfortably run — 7B, 3B, or 1.5B —
-  with zero configuration.
-- **🛡️ AST-gate isolation.** Every generated module is parsed with `rnix` before
-  it is ever handed to `nixos-rebuild`. Malformed Nix is caught locally, with
-  byte-precise diagnostics, and never reaches your system.
-- **♻️ Self-healing build loop.** On a failed build, the agent parses the Nix
-  error (file, line, column, symbol), correlates it back to its own AST, and
-  re-prompts the model with grounded context — bounded to three attempts.
-- **⏪ Automatic rollback.** If the loop exhausts its attempts, the original
-  configuration is restored verbatim. Your system is never left in a broken
-  intermediate state.
-- **📦 One-command install.** Ships as a Nix flake. The Vulkan loader is wrapped
-  into the binary, so the GPU survives even when the agent runs under `sudo`.
+**Experimental, alpha.** Treat it accordingly.
+
+- Run it against a **VM or a non-critical NixOS machine** before you point it at anything you care about.
+- The model's output is treated as untrusted. The human review step is not optional — it is the point.
+- Current scope is small, deliberately: generating self-contained modules (packages, programs, simple services) and validating them through Nix.
+- Out of scope today: anything touching users, secrets, disks, bootloader, or encryption (see [Non-goals](#non-goals)). Home Manager and flake-vs-channel handling are partial and evolving.
+
+If something here reads like a guarantee, read it again — it is a safety *mechanism*, not a promise.
 
 ---
 
-## How It Works
+## Why this exists
+
+Handing an LLM shell access to a running system is a bad idea, and most "AI sysadmin" tools do exactly that: the model emits commands and something runs them. There is no review surface, no isolation, and no honest way to undo the result.
+
+NixOS is a better substrate for this problem. Configuration is declarative, builds are evaluated before they activate, and previous generations stay around. That lets you constrain the model to something far narrower than "run commands": produce a **declarative module**, and let Nix decide whether it's valid.
+
+So `nix-agent` never asks the model for shell commands. It asks for one small Nix module, isolates it, validates it with a real parser and with `nixos-rebuild`, and keeps the privileged step behind an explicit, separate command. The interesting part isn't that an AI writes config — it's that the AI is given the least authority that still does the job.
+
+Local-first, too: the option index and (optionally) the model run on your machine.
+
+---
+
+## How it works
 
 ```
-  prompt ──▶ [RAG retrieval] ──▶ [LLM generation] ──▶ [AST gate] ──▶ [nixos-rebuild]
-                  │                     ▲                                  │
-            local options          re-prompt with                    pass │ fail
-            (SQLite index)         grounded error ◀───[parse stderr]◀──────┘
-                                        │                                  │
-                                   (max 3 tries)                      git diff ✓
+plan  — read-only, unprivileged
+  prompt
+    → retrieve relevant options from the local NixOS option index
+    → model proposes ONE isolated Nix module (never shell commands)
+    → AST / syntax gate (rnix); bounded repair loop, max 3 attempts
+    → write a plan file; show the module, a risk level, and a short explanation
+       (nothing is activated)
+
+apply — privileged, explicit
+  plan file
+    → install the validated module into <config-dir>/modules/ai-generated/
+    → nixos-rebuild test
+    → on failure: remove the generated module; do not leave it staged
 ```
+
+The model proposes; Nix validates. A module that doesn't parse never reaches `apply`. A module that doesn't build is removed rather than left behind.
 
 ---
 
-## One-Command Quickstart
+## Quickstart
 
-Run the agent on the fly — no cloning, no build step. Nix fetches, compiles, and
-executes it in a single command:
+You need Nix with flakes enabled (`experimental-features = nix-command flakes`).
+
+Start read-only and unprivileged. This generates and validates a module and prints it. It does **not** change your system:
 
 ```bash
-sudo nix run github:youruser/nix-agent -- run "add tmux with custom keybindings"
+nix run github:youruser/nix-agent -- plan "add tmux with vi-style keybindings"
 ```
 
-> Requires Nix with flakes enabled:
-> `nix-command` and `flakes` in your `experimental-features`.
-> The first invocation compiles the project and downloads the hardware-matched
-> model; subsequent runs are instant and offline.
+Review the printed module and the plan file (`./.nix-agent-plan.nix`). When you're satisfied, apply it deliberately:
 
-The agent will print its pipeline as it works:
+```bash
+sudo nix run github:youruser/nix-agent -- apply --plan <plan-id>
+```
 
-```
-[1/3] Analyzing system context...
-      RAG index: 18432 options
-      Hardware tier: HighEnd → 7B model (qwen2.5-coder-7b-instruct-q4_k_m.gguf)
-      Model ready: /root/.cache/nix-agent/models/...
-[2/3] Generating Nix module...
-[3/3] Testing and activating configuration...
-✓ System rebuilt and activated (attempts: 1).
-```
+Replace `youruser` with the actual repo owner. On first use the local option index is empty; see [Usage](#usage) for the one-time ingest step that makes generation useful.
 
 ---
 
-## Declarative Installation
+## Example plan
 
-For a permanent install, add `nix-agent` as a flake input and drop it into your
-`environment.systemPackages`.
+```bash
+nix-agent plan "add tmux with vi-style keybindings"
+```
+
+`plan` retrieves the relevant options, generates a module, runs it through the syntax gate, and prints a summary — a plan id, a risk level, and the module itself:
+
+```
+Plan      2026-06-29-tmux-vi
+Risk      R1 — userland program configuration
+Module    modules/ai-generated/2026-06-29-tmux-vi.nix   (written on apply)
+Summary   Enables tmux and sets vi-style key bindings.
+
+This was a dry run. Nothing was activated.
+Apply with:  sudo nix-agent apply --plan 2026-06-29-tmux-vi
+```
+
+The generated module is a small, self-contained file you can read in full:
 
 ```nix
-# flake.nix
+{ config, pkgs, ... }:
+
+{
+  # Generated by nix-agent. Review before apply.
+  programs.tmux = {
+    enable = true;
+    keyMode = "vi";
+    extraConfig = ''
+      # vi-style pane navigation
+      bind h select-pane -L
+      bind j select-pane -D
+      bind k select-pane -U
+      bind l select-pane -R
+    '';
+  };
+}
+```
+
+Nothing here is magic, and that's deliberate: it's a normal module you could have written, scoped to one concern, easy to diff and easy to delete.
+
+---
+
+## Installation
+
+You can run `nix-agent` ad hoc with `nix run` (see [Quickstart](#quickstart)) and never install it.
+
+For a persistent install, add it as a flake input:
+
+```nix
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -103,138 +146,177 @@ For a permanent install, add `nix-agent` as a flake input and drop it into your
       system = "x86_64-linux";
       modules = [
         ./configuration.nix
-        ({ pkgs, ... }: {
-          environment.systemPackages = [
-            nix-agent.packages.${pkgs.system}.default
-          ];
-        })
+        { environment.systemPackages = [ nix-agent.packages.x86_64-linux.default ]; }
       ];
     };
   };
 }
 ```
 
-Then rebuild once, and `nix-agent` is available system-wide:
+To let `apply` install modules into your tree, wire the sandbox directory into your configuration once:
 
-```bash
-sudo nixos-rebuild switch --flake .#myhost
+```nix
+# configuration.nix
+{
+  imports = [ ./modules/ai-generated ];   # a directory containing a default.nix
+}
 ```
 
-> Replace `youruser` with your GitHub handle (or a local `path:` reference) in
-> both the quickstart and the input URL.
+Then point `nix-agent` at that tree with `NIX_AGENT_CONFIG_DIR` (see [Configuration](#configuration)).
 
 ---
 
 ## Usage
 
-### 1. Index the NixOS option corpus (one-time)
-
-The agent grounds every generation in the real NixOS option set. Build the
-options dump and ingest it into the local RAG database:
+**1. Build the local option index (one-time).** Generation is grounded in your actual NixOS options rather than the model's memory. Produce an options dump and ingest it:
 
 ```bash
-# Produce options.json from your current nixpkgs:
 nix-build -E '(import <nixpkgs/nixos> { configuration = {}; }).config.system.build.manual.optionsJSON' -o options
-
 nix-agent ingest options/share/doc/nixos/options.json
 ```
 
-### 2. Mutate the system
+**2. Plan a change (read-only, no root).**
 
 ```bash
-# Generate → test → activate, in one shot:
-sudo nix-agent run "enable the openssh daemon and open port 22"
-
-# `heal` is an alias for `run`:
-sudo nix-agent heal "install firefox and enable bluetooth"
+nix-agent plan "install ripgrep and fd"
 ```
 
-If the model's first attempt fails to build, you'll see compact repair status —
-not a wall of `stderr`:
+If the first generation doesn't parse, you'll see compact repair status rather than a wall of `stderr`:
 
 ```
-      [Attempt 1] error detected: UndefinedVariable: pkgs
-      [Attempt 2] Repairing: AI is rewriting the module...
-✓ System rebuilt and activated (attempts: 2).
+[Attempt 1] syntax error: unexpected '}'
+[Attempt 2] repairing module...
+Plan validated — AST gate passed (2 attempts).
 ```
+
+**3. Apply the plan (privileged, explicit).**
+
+```bash
+# by plan id, as printed by `plan`...
+sudo nix-agent apply --plan 2026-06-29-ripgrep-fd
+
+# ...or by path to the plan file:
+sudo nix-agent apply --plan ./.nix-agent-plan.nix
+```
+
+`apply` installs the module under `<config-dir>/modules/ai-generated/`, runs `nixos-rebuild test`, and removes the module if the build fails.
 
 ---
 
-## Hardware Tiers
+## Risk levels
 
-At startup the agent reads total system RAM and picks a model automatically.
+`nix-agent` classifies each request into a risk tier. The tier shapes what the tool is willing to do automatically and what it pushes back to you. In this alpha, the binding control is still your review and the explicit `apply` step — the tiers describe policy and intent, not a substitute for reading the diff.
 
-| Tier        | RAM        | Model                          | Approx. download |
-| ----------- | ---------- | ------------------------------ | ---------------- |
-| **HighEnd** | ≥ 16 GiB   | Qwen2.5-Coder-7B-Instruct      | ~4.7 GB          |
-| **Medium**  | ≥ 8 GiB    | Qwen2.5-Coder-3B-Instruct      | ~2.1 GB          |
-| **Low**     | < 8 GiB    | Qwen2.5-Coder-1.5B-Instruct    | ~1.1 GB          |
+| Level | Scope | Policy |
+| ----- | ----- | ------ |
+| **R0** | Read-only explanation / diagnosis | Always allowed |
+| **R1** | Packages, fonts, harmless userland modules | Planned normally |
+| **R2** | Services, desktop, power settings | Explicit review required before apply |
+| **R3** | Networking, firewall, SSH, GPU, kernel params | Plan-only by default; extra confirmation to apply |
+| **R4** | Users, secrets, filesystems, bootloader, disk encryption | Not auto-applied; emitted only as manual guidance, or refused |
 
-All models are Q4_K_M quantized GGUF and run with `n_gpu_layers = 99` (full GPU
-offload).
+The short version: R0/R1 are routine, R2 wants a deliberate look, R3 is something you opt into, and R4 is not the kind of change an agent should be making for you.
 
 ---
 
-## Environment Variables
+## Safety model
 
-Every path and tunable has a sensible default and can be overridden:
+The safety model is the project. It is worth stating plainly.
 
-| Variable               | Default                              | Description                                          |
-| ---------------------- | ------------------------------------ | ---------------------------------------------------- |
-| `NIX_AGENT_CONFIG`     | `/etc/nixos/configuration.nix`       | The `.nix` file the agent rewrites and rebuilds.     |
-| `NIX_AGENT_DB`         | `~/.cache/nix-agent/rag.db`          | SQLite file backing the local NixOS-options index.   |
-| `NIX_AGENT_MODEL_CACHE`| `~/.cache/nix-agent/models`          | Hugging Face cache for downloaded GGUF weights.      |
-| `NIX_AGENT_TIMEOUT`    | `60`                                 | Per-`nixos-rebuild` wall-clock budget, in seconds.   |
+- **Two phases, two privilege levels.** `plan` is read-only and unprivileged and cannot activate anything. `apply` is the only step that touches the system, and you have to run it on purpose.
+- **Your main config is never edited.** `nix-agent` only writes isolated modules into `<config-dir>/modules/ai-generated/`. Your `configuration.nix` is read for context, never modified or overwritten.
+- **LLM output is treated as untrusted.** The model proposes a module; Nix validates it. A module that fails the AST/syntax gate is never staged, and a module that fails `nixos-rebuild` is removed.
+- **No model-generated shell commands.** The tool never asks the model for commands to run. The only thing it accepts back is a Nix module, which is inert until Nix evaluates it.
+- **Generated patches are isolated and reviewable.** One concern per module, written to a predictable path, easy to read, diff, or delete by hand.
+- **High-risk changes are not auto-applied.** R3 is plan-only by default; R4 is refused or emitted as manual guidance.
+- **Rollback-aware, not rollback-guaranteed.** `apply` uses `nixos-rebuild test`, which activates runtime changes until the next reboot and does not write your boot default. On failure the generated module is removed and not left staged, and your previous NixOS generations remain available. Rollback is a safety net, not the primary safety mechanism — the primary mechanism is that you reviewed the module before applying it.
+
+---
+
+## Configuration
+
+Everything has a sensible default and can be overridden by environment variable.
+
+| Variable | Default | Meaning |
+| -------- | ------- | ------- |
+| `NIX_AGENT_CONFIG` | `/etc/nixos/configuration.nix` | Main config — read for context, **never edited**. |
+| `NIX_AGENT_CONFIG_DIR` | `.` (current directory) | Sandbox root; modules are written under `<dir>/modules/ai-generated/`. Defaults to the working directory so you can test without root. Set to `/etc/nixos` in production. |
+| `NIX_AGENT_DB` | `~/.cache/nix-agent/rag.db` | SQLite index of NixOS options used for retrieval. |
+| `NIX_AGENT_MODEL_CACHE` | `~/.cache/nix-agent/models` | Cache for an optional local model. |
+| `NIX_AGENT_TIMEOUT` | `60` | Per-`nixos-rebuild` time budget, in seconds. |
 
 ```bash
-# Example: point the agent at a non-standard config and a project-local index.
-NIX_AGENT_CONFIG=/etc/nixos/hosts/laptop.nix \
+# Plan into a real config tree using a project-local index, still no root:
+NIX_AGENT_CONFIG_DIR=/etc/nixos \
 NIX_AGENT_DB=./nix-agent.db \
-  sudo -E nix-agent run "enable docker"
+  nix-agent plan "add the fish shell"
 ```
 
 ---
 
-## Building from Source
+## Building from source
 
-The flake handles everything — the C/C++ toolchain, `cmake`, the Vulkan SDK, and
-`bindgen` — automatically:
-
-```bash
-nix build github:youruser/nix-agent     # → ./result/bin/nix-agent
-nix develop                             # dev shell with `cargo build --features vulkan`
-```
-
-To build with plain `cargo` outside Nix, you must supply the native toolchain
-yourself and select an acceleration backend:
+`nix-agent` is a Rust CLI. The default build is intentionally light and has **no native dependencies** — useful for development and CI, and fine for driving the pipeline.
 
 ```bash
-cargo build --release --features vulkan   # Linux / NixOS
-cargo build --release --features metal    # macOS
+cargo build --release
 ```
 
-The base crate (no `--features`) builds with **zero native dependencies** — the
-inference engine is gated behind the `embedded-llm` feature (implied by `vulkan`
-and `metal`), so CI and contributors without a C++ toolchain stay fast and green.
+Local inference is **optional** and lives behind build features, because it pulls in a C/C++ toolchain (it builds `llama.cpp`) and, where supported, a GPU backend:
+
+```bash
+cargo build --release --features embedded-llm   # CPU; portable
+cargo build --release --features vulkan          # Linux / NixOS GPU path
+cargo build --release --features metal           # macOS GPU path
+```
+
+Whether acceleration is actually used depends on your platform, drivers, and how you built it. The Vulkan and Metal paths are convenience features, not guarantees — if a backend isn't available, that's a build/runtime detail to check, not something the tool hides from you. The flake packages the Linux/Vulkan build and wires the loader into the binary; see `flake.nix`.
+
+When the embedded backend is enabled, the model is chosen by available RAM:
+
+| RAM | Model |
+| --- | ----- |
+| ≥ 16 GiB | Qwen2.5-Coder-7B (GGUF, quantized) |
+| ≥ 8 GiB | Qwen2.5-Coder-3B |
+| < 8 GiB | Qwen2.5-Coder-1.5B |
 
 ---
 
-## Safety Model
+## Limitations
 
-`nix-agent` is built to follow the immutability of NixOS, not fight it:
+- **NixOS configurations vary enormously.** What's idiomatic on one machine is wrong on another. Generated modules are a starting point, not gospel.
+- **Flakes, channels, and Home Manager differ.** Support depends on implementation status and may not match your setup. Check the generated module against how *your* system is organized.
+- **Some changes can't be made safely by an agent.** Anything in R4 — users, secrets, disks, bootloader, encryption — is out, by design.
+- **LLM output is untrusted until validated.** The syntax gate catches malformed Nix, not bad ideas. Semantic review is on you.
+- **`nixos-rebuild test` activates runtime changes.** It doesn't change your boot default, but it does change the running system until reboot. Review still matters.
+- **Local inference support is uneven.** It depends on your backend, platform, drivers, and build features. Without the embedded backend, you'll want to supply your own.
+- **The repair loop is bounded.** Up to three attempts, then it stops and tells you. It does not promise to fix every NixOS error.
 
-- **No imperative edits.** All AST mutations produce a *new* source string; the
-  agent decides when to stage it, and always under a backup.
-- **Default build mode is activation-aware.** `run` uses `nixos-rebuild test`
-  (build + activate until reboot), so a successful change is real but never
-  silently written to your bootloader.
-- **Local cache probe before any download.** The model is fetched only on first
-  run, with an explicit progress notice; after that the agent is air-gapped.
-- **Bounded autonomy.** The self-healing loop is hard-capped at three attempts
-  and rolls back on exhaustion.
+---
+
+## Roadmap
+
+Short and honest:
+
+- Home Manager support
+- prompt-to-rice / desktop theming
+- dev shell (`devShell`) generation
+- a better NixOS option resolver
+- an incident / doctor mode for diagnosis
+- improvements to the optional embedded GGUF backend
+
+---
+
+## Non-goals
+
+- **Not an autonomous sysadmin.** It plans and proposes; it doesn't run your machine.
+- **Not a replacement for understanding your config.** If you can't read the module, don't apply it.
+- **Does not execute arbitrary shell commands** generated by the model. Ever.
+- **Does not automatically edit** bootloader, disks, encryption, users, secrets, or SSH/firewall configuration.
+- **Does not promise to fix every NixOS error.** Some problems need a human who knows the system.
 
 ---
 
 ## License
 
-Released under the [MIT License](LICENSE).
+MIT. See [LICENSE](LICENSE).
