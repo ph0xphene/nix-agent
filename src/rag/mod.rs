@@ -369,6 +369,35 @@ impl EmbeddedLlamaBackend {
         }
     }
 
+    /// Load an explicit GGUF file (e.g. chosen via `--model` or the model
+    /// manager) instead of resolving one from the hardware tier. Bypasses the
+    /// Hugging Face download path entirely; the inference core (context setup,
+    /// tokenization) is unchanged — only the weights source differs.
+    pub fn load_from_path(
+        tier: HardwareTier,
+        model_path: &std::path::Path,
+    ) -> Result<Self, RagError> {
+        #[cfg(not(feature = "embedded-llm"))]
+        {
+            let _ = model_path;
+            Err(RagError::Backend(format!(
+                "embedded inference for tier {} is not compiled in; rebuild with \
+                 `--features embedded-llm` (or `--features metal`/`--features vulkan`)",
+                tier.label(),
+            )))
+        }
+        #[cfg(feature = "embedded-llm")]
+        {
+            let engine = embedded::Engine::load(model_path, FULL_GPU_OFFLOAD)
+                .map_err(|e| RagError::Backend(format!("failed to load GGUF model: {e}")))?;
+            Ok(Self {
+                tier,
+                model_path: model_path.to_path_buf(),
+                engine,
+            })
+        }
+    }
+
     /// The detected hardware tier this backend was built for.
     pub fn tier(&self) -> HardwareTier {
         self.tier
